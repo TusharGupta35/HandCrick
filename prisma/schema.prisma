@@ -1,0 +1,35 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../app/lib/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id         String   @id @default(cuid())
+  username   String   @unique
+  password   String
+  games      Int      @default(0)
+  wins       Int      @default(0)
+  losses     Int      @default(0)
+  ties       Int      @default(0)
+  totalRuns  Int      @default(0)
+  bestScore  Int      @default(0)
+  gameHistory Game[]  @relation("UserGames")
+}
+
+model Game {
+  id        String   @id @default(cuid())
+  user      User     @relation(fields: [userId], references: [id], name: "UserGames")
+  userId    String
+  result    String
+  runs      Int
+  createdAt DateTime @default(now())
+}
