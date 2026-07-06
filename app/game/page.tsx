@@ -1,8 +1,29 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 const API_URL = "/api/auth";
+
+const countRaisedFingers = (landmarks: Array<{ x: number; y: number; z: number }>) => {
+  const thumbTip = landmarks[4];
+  const thumbPip = landmarks[2];
+  const indexTip = landmarks[8];
+  const indexPip = landmarks[6];
+  const middleTip = landmarks[12];
+  const middlePip = landmarks[10];
+  const ringTip = landmarks[16];
+  const ringPip = landmarks[14];
+  const pinkyTip = landmarks[20];
+  const pinkyPip = landmarks[18];
+
+  return [
+    thumbTip.x < thumbPip.x - 0.04,
+    indexTip.y < indexPip.y,
+    middleTip.y < middlePip.y,
+    ringTip.y < ringPip.y,
+    pinkyTip.y < pinkyPip.y,
+  ].filter(Boolean).length;
+};
 
 type UserRecord = {
   games: number;
@@ -36,6 +57,15 @@ export default function GamePage() {
   const [result, setResult] = useState("");
   const [resultType, setResultType] = useState<ResultType>(null);
   const [statusMessage, setStatusMessage] = useState("You are batting first. Choose your number.");
+  const [cameraMode, setCameraMode] = useState(false);
+  const [cameraStatus, setCameraStatus] = useState("Camera off");
+  const [gestureLabel, setGestureLabel] = useState("No hand detected");
+  const [pendingGesture, setPendingGesture] = useState<Choice | null>(null);
+  const [countdown, setCountdown] = useState<number | null>(null);
+  const [collectedInputs, setCollectedInputs] = useState<Choice[]>([]);
+  const [roundActive, setRoundActive] = useState(false);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const lastGestureRef = useRef<number | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -48,7 +78,6 @@ export default function GamePage() {
       }
       const body = await res.json();
       setUsername(body.user.username);
-      // fetch profile stats from server
       const stats = await fetch(`/api/user/stats/${body.user.username}`);
       if (!active) return;
       if (stats.ok) {
@@ -64,6 +93,120 @@ export default function GamePage() {
     };
   }, [router]);
 
+  useEffect(() => {
+    if (!cameraMode) {
+      setCameraStatus("Camera off");
+      setGestureLabel("No hand detected");
+      lastGestureRef.current = null;
+      return;
+    }
+
+    let stream: MediaStream | null = null;
+    let cancelled = false;
+    let frameId = 0;
+    let handsInstance: any = null;
+
+    const setupCamera = async () => {
+      if (typeof window === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+        setCameraStatus("Camera not available");
+        return;
+      }
+
+      const video = videoRef.current;
+      if (!video) return;
+
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" }, audio: false });
+      video.srcObject = stream;
+      await video.play();
+      setCameraStatus("Camera ready");
+
+      const { Hands } = await import("@mediapipe/hands");
+      handsInstance = new Hands({
+        locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+      });
+
+      handsInstance.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.7,
+        minTrackingConfidence: 0.7,
+      });
+
+      handsInstance.onResults((results: any) => {
+        if (cancelled) return;
+        const landmarks = results.multiHandLandmarks?.[0];
+        if (!landmarks) {
+          setGestureLabel("No hand detected");
+          return;
+        }
+
+        const fingerCount = countRaisedFingers(landmarks);
+        if (fingerCount >= 1 && fingerCount <= 6) {
+          if (lastGestureRef.current !== fingerCount) {
+            lastGestureRef.current = fingerCount;
+            setGestureLabel(`Detected ${fingerCount}`);
+            setPendingGesture(fingerCount as Choice);
+          }
+        } else {
+          setGestureLabel("Show 1–6 fingers");
+        }
+      });
+
+      const tick = async () => {
+        if (!cancelled && video.readyState >= 2) {
+          await handsInstance.send({ image: video });
+        }
+        frameId = window.requestAnimationFrame(tick);
+      };
+
+      tick();
+    };
+
+    setupCamera().catch((error) => {
+      console.error(error);
+      setCameraStatus("Camera unavailable");
+    });
+
+    return () => {
+      cancelled = true;
+      if (frameId) window.cancelAnimationFrame(frameId);
+      if (stream) {
+        stream.getTracks().forEach((track) => track.stop());
+      }
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+      }
+    };
+  }, [cameraMode]);
+
+  useEffect(() => {
+    if (pendingGesture === null || phase !== "playing" || !roundActive) return;
+    
+    if (collectedInputs.length < 3) {
+      setCollectedInputs((prev) => [...prev, pendingGesture]);
+    }
+    setPendingGesture(null);
+  }, [pendingGesture, phase, roundActive, collectedInputs.length]);
+
+  useEffect(() => {
+    if (countdown === null) return;
+    
+    if (countdown === 0) {
+      setRoundActive(false);
+      setCountdown(null);
+      if (collectedInputs.length > 0) {
+        processCollectedInputs();
+      }
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setCountdown(countdown - 1);
+    }, 1000);
+
+    return () => window.clearTimeout(timer);
+  }, [countdown]);
+
   const resetGame = () => {
     setPhase("playing");
     setCurrentMode("batting");
@@ -77,6 +220,22 @@ export default function GamePage() {
     setResult("");
     setResultType(null);
     setStatusMessage("You are batting first. Choose your number.");
+    setCountdown(null);
+    setCollectedInputs([]);
+    setRoundActive(false);
+  };
+
+  const startRound = () => {
+    setCollectedInputs([]);
+    setRoundActive(true);
+    setCountdown(3);
+  };
+
+  const processCollectedInputs = () => {
+    collectedInputs.forEach((input) => {
+      playBall(input);
+    });
+    setCollectedInputs([]);
   };
 
   const addHistory = (entry: string) => setHistory((prev) => [entry, ...prev]);
@@ -257,6 +416,13 @@ export default function GamePage() {
               </button>
               <button
                 type="button"
+                onClick={() => setCameraMode((value) => !value)}
+                className="rounded-full border border-cyan-500/40 bg-cyan-500/10 px-5 py-3 text-sm font-semibold text-cyan-200 transition hover:border-cyan-400 hover:bg-cyan-500/20"
+              >
+                {cameraMode ? "Stop camera" : "Play with camera"}
+              </button>
+              <button
+                type="button"
                 onClick={handleLogout}
                 className="rounded-full bg-rose-500 px-5 py-3 text-sm font-semibold text-slate-950 transition hover:bg-rose-400"
               >
@@ -296,18 +462,91 @@ export default function GamePage() {
               </div>
 
               <div className="grid gap-3 sm:grid-cols-3">
-                {choices.map((choice) => (
-                  <button
-                    key={choice}
-                    type="button"
-                    disabled={phase !== "playing"}
-                    onClick={() => playBall(choice)}
-                    className="rounded-3xl border border-slate-700 bg-slate-950 px-5 py-4 text-lg font-semibold text-white transition hover:border-cyan-400 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {choice}
-                  </button>
-                ))}
+                {roundActive ? (
+                  <>
+                    {choices.map((choice) => (
+                      <button
+                        key={choice}
+                        type="button"
+                        onClick={() => {
+                          if (collectedInputs.length < 3) {
+                            setCollectedInputs((prev) => [...prev, choice]);
+                          }
+                        }}
+                        disabled={collectedInputs.length >= 3}
+                        className={`rounded-3xl border px-5 py-4 text-lg font-semibold transition ${
+                          collectedInputs.length >= 3
+                            ? "border-slate-700 bg-slate-950 text-slate-500 cursor-not-allowed opacity-50"
+                            : "border-slate-700 bg-slate-950 text-white hover:border-cyan-400 hover:bg-slate-800"
+                        }`}
+                      >
+                        {choice}
+                      </button>
+                    ))}
+                  </>
+                ) : (
+                  <>
+                    {choices.map((choice) => (
+                      <button
+                        key={choice}
+                        type="button"
+                        disabled={phase !== "playing"}
+                        onClick={() => playBall(choice)}
+                        className="rounded-3xl border border-slate-700 bg-slate-950 px-5 py-4 text-lg font-semibold text-white transition hover:border-cyan-400 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {choice}
+                      </button>
+                    ))}
+                  </>
+                )}
               </div>
+
+              {roundActive && (
+                <div className="rounded-3xl border border-cyan-500/40 bg-cyan-500/10 p-6 text-center">
+                  <p className="text-sm uppercase tracking-[0.35em] text-cyan-300/80 mb-3">Countdown</p>
+                  <div className="text-6xl font-bold text-cyan-300 mb-4">
+                    {countdown === 0 ? (
+                      <span className="text-emerald-400 animate-pulse">SNAP!</span>
+                    ) : (
+                      <span>{countdown}</span>
+                    )}
+                  </div>
+                  <p className="text-slate-300">
+                    Inputs collected: <span className="font-semibold text-cyan-300">{collectedInputs.length}/3</span>
+                  </p>
+                  {collectedInputs.length > 0 && (
+                    <div className="mt-3 flex flex-wrap justify-center gap-2">
+                      {collectedInputs.map((input, idx) => (
+                        <span key={idx} className="rounded-full bg-cyan-500/30 px-3 py-1 text-sm font-semibold text-cyan-200">
+                          {input}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {phase === "playing" && !roundActive && cameraMode && (
+                <button
+                  type="button"
+                  onClick={startRound}
+                  className="w-full rounded-3xl border border-emerald-500/40 bg-emerald-500/10 px-5 py-4 text-lg font-semibold text-emerald-200 transition hover:border-emerald-400 hover:bg-emerald-500/20"
+                >
+                  Start Round (3 Inputs)
+                </button>
+              )}
+
+              {cameraMode ? (
+                <div className="rounded-3xl border border-slate-800 bg-slate-950/90 p-4 text-slate-300">
+                  <div className="mb-3 flex items-center justify-between">
+                    <p className="text-sm uppercase tracking-[0.35em] text-cyan-300/80">Camera mode</p>
+                    <span className="rounded-full bg-cyan-500/10 px-3 py-1 text-xs text-cyan-200">{cameraStatus}</span>
+                  </div>
+                  <video ref={videoRef} autoPlay muted playsInline className="w-full rounded-2xl border border-slate-700 bg-black" />
+                  <p className="mt-3 text-sm text-slate-400">Show 1–6 fingers to choose your next number. The app will use the gesture after a short pause.</p>
+                  <p className="mt-2 text-sm text-cyan-200">{gestureLabel}</p>
+                </div>
+              ) : null}
 
               {phase === "result" ? (
                 <div className={`rounded-3xl border p-5 transition duration-500 ${
